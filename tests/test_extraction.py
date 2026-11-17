@@ -256,3 +256,17 @@ def test_generic_nested_id_conflict_rejected():
 def test_malformed_hydration_attempts_bounded():
     assert parse_html_states('self.__pace_f.push(not_json);' * 1000) == []
     assert parse_html_states('x' * 6_000_001) == []
+
+
+def test_categorize_title_and_diagnostic_safety():
+    from app.browser import categorize_title
+    assert categorize_title("访问验证 - 抖音") == "security_challenge"
+    assert categorize_title("滑动完成验证") == "security_challenge"
+    assert categorize_title("Please verify captcha") == "security_challenge"
+    assert categorize_title("登录 - 抖音") == "login_required"
+    assert categorize_title("用户登录 passport") == "login_required"
+    assert categorize_title("该作品已被删除") == "not_found"
+    assert categorize_title("页面不存在 404") == "not_found"
+    assert categorize_title("抖音 - 记录美好生活") == "douyin_normal"
+    assert categorize_title("") == "empty"
+    assert categorize_title(None) == "empty"
