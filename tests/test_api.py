@@ -158,10 +158,29 @@ async def test_key_and_cors(client, monkeypatch):
     monkeypatch.setattr(settings, 'API_KEY', 'synthetic-test-key')
     assert (await client.post('/api/parse', json={'text': URL})).status_code == 401
     assert (await client.post('/api/parse', json={'text': URL}, headers={'Authorization': 'Bearer synthetic-test-key', 'Origin': 'https://evil.example'})).status_code == 403
+    # Preflight OPTIONS 请求
     response = await client.options('/api/parse', headers={'Origin': 'http://localhost:8080', 'Access-Control-Request-Method': 'POST'})
     assert response.headers['access-control-allow-origin'] == 'http://localhost:8080'
+    assert 'POST' in response.headers.get('access-control-allow-methods', '')
     response = await client.options('/api/parse', headers={'Origin': 'https://evil.example', 'Access-Control-Request-Method': 'POST'})
     assert 'access-control-allow-origin' not in response.headers
+
+    # 实际跨域请求验证 Expose-Headers 暴露 Retry-After、Content-Length、Content-Disposition
+    health = await client.get('/api/health', headers={'Origin': 'http://localhost:8080'})
+    assert health.status_code == 200
+    exposed = [h.strip().lower() for h in health.headers.get('access-control-expose-headers', '').split(',')]
+    assert 'retry-after' in exposed
+    assert 'content-length' in exposed
+    assert 'content-disposition' in exposed
+
+async def test_cors_retry_after_on_rate_limit(client, monkeypatch):
+    job = await parsed(client)
+    monkeypatch.setattr(settings, 'RATE_LIMIT_PARSE_PER_MINUTE', 1)
+    res = await client.post('/api/parse', json={'text': URL}, headers={'Origin': 'http://localhost:8080'})
+    assert res.status_code == 429
+    assert res.headers.get('retry-after') == '60'
+    exposed = [h.strip().lower() for h in res.headers.get('access-control-expose-headers', '').split(',')]
+    assert 'retry-after' in exposed
 
 async def test_ttl_and_limits(client, monkeypatch):
     job = await parsed(client)

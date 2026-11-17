@@ -11,11 +11,15 @@ function connection(online){state.connected=online;$('#connectionDot').classList
 function validBase(value){const u=new URL(value);if(u.username || u.password || u.search || u.hash || u.pathname!=='/')throw Error('请填写不含账号、路径或参数的后端根地址');if(u.protocol!=='https:' && !(u.protocol==='http:' && ['localhost','127.0.0.1','[::1]'].includes(u.hostname)))throw Error('公网后端必须使用 HTTPS');return u.origin;}
 async function api(path,options={},timeout=20000){
   if(!state.base)throw Error('尚未配置后端地址');
+  const targetBase=state.base;
   const headers={...options.headers};if(state.key)headers.Authorization=`Bearer ${state.key}`;
   if(options.body)headers['Content-Type']='application/json';
   let response;
-  try{response=await fetch(state.base+path,{...options,headers,signal:AbortSignal.timeout(timeout),cache:'no-store',referrerPolicy:'no-referrer'});}
-  catch{connection(false);throw Error('无法连接后端。请检查地址、HTTPS、网络和 CORS；免费实例唤醒可能需要约一分钟。');}
+  try{response=await fetch(targetBase+path,{...options,headers,signal:AbortSignal.timeout(timeout),cache:'no-store',referrerPolicy:'no-referrer'});}
+  catch{
+    if(state.base===targetBase)connection(false);
+    throw Error('无法连接后端。请检查地址、HTTPS、网络和 CORS；免费实例唤醒可能需要约一分钟。');
+  }
   let data;try{data=await response.json();}catch{throw Error('后端未返回有效 API 数据，可能尚在唤醒或地址不正确。');}
   if(!response.ok){
     const err = Error(typeof data.detail==='string'?data.detail:`请求失败（HTTP ${response.status}）`);
@@ -68,6 +72,96 @@ async function download(posts,assets,metadataIds=[]){
       const row=el('div','transfer'),head=el('div','transfer-head'),status=el('strong','','正在连接源文件'),bar=el('progress'),meta=el('p','transfer-meta');
       head.append(el('span','',`${post.author||post.id} · ${asset.kind==='image'?asset.label:labels[asset.kind]}`),status);
       bar.max=1;bar.removeAttribute('value');bar.setAttribute('aria-label','单文件下载进度');row.append(head,bar,meta);$('#transfers').prepend(row);
+
+      // 原图优先尝试浏览器直链直连，规避服务端带宽消耗（实测图片支持 CORS，视频跨域拒绝则走兼容中继）
+      let handledDirectly = false;
+      if (asset.kind === 'image' && safeSource(asset.url)) {
+        status.textContent = '正在直连源站获取…';
+        const fileController = new AbortController();
+        state.controller = fileController;
+        let directTimedOut = false;
+        const directTimer = setTimeout(() => { directTimedOut = true; try { fileController.abort(); } catch (_) {} }, 20000);
+        try {
+          const directResp = await fetch(asset.url, {
+            mode: 'cors',
+            credentials: 'omit',
+            referrerPolicy: 'no-referrer',
+            signal: fileController.signal
+          });
+          if (!directResp.ok) throw Error(`源站返回 HTTP ${directResp.status}`);
+
+          const expected = Number(directResp.headers.get('content-length')) || 0;
+          if (expected > state.fileLimit || total + expected > state.batchLimit) {
+            try { fileController.abort(); } catch (_) {}
+            throw Error('文件或本批总量超过安全限制，请减小选择范围');
+          }
+
+          const reader = directResp.body.getReader(), chunks = [];
+          let received = 0;
+          while (true) {
+            if (state.stop) { try { fileController.abort(); } catch (_) {} break; }
+            const {done, value} = await reader.read();
+            if (done) break;
+            received += value.byteLength;
+            total += value.byteLength;
+            if (received > state.fileLimit || total > state.batchLimit) {
+              try { fileController.abort(); } catch (_) {}
+              throw Error('文件或本批总量超过安全限制');
+            }
+            chunks.push(value);
+            meta.textContent = `本文件 ${bytes(received)}${expected ? ` / ${bytes(expected)}` : ''} · 本批已接收 ${bytes(total)}`;
+            if (expected) bar.value = Math.min(received / expected, 1);
+          }
+
+          if (state.stop) throw Error('已停止下载');
+          if (expected && received !== expected) throw Error('源文件传输不完整');
+
+          const firstChunk = chunks[0] || new Uint8Array(0);
+          const isWebp = firstChunk.length >= 12 && firstChunk[0]===0x52 && firstChunk[1]===0x49 && firstChunk[2]===0x46 && firstChunk[3]===0x46 && firstChunk[8]===0x57 && firstChunk[9]===0x45 && firstChunk[10]===0x42 && firstChunk[11]===0x50;
+          const isJpg = firstChunk.length >= 3 && firstChunk[0]===0xff && firstChunk[1]===0xd8 && firstChunk[2]===0xff;
+          const isPng = firstChunk.length >= 8 && firstChunk[0]===0x89 && firstChunk[1]===0x50 && firstChunk[2]===0x4e && firstChunk[3]===0x47;
+          if (!isWebp && !isJpg && !isPng) {
+            throw Error('源站未返回受支持的图片格式，可能需要验证或页面已变更');
+          }
+
+          const ext = isWebp ? 'webp' : isJpg ? 'jpg' : 'png';
+          const mime = isWebp ? 'image/webp' : isJpg ? 'image/jpeg' : 'image/png';
+          const filename = `${post.id}_${asset.label}.${ext}`;
+
+          const url = URL.createObjectURL(new Blob(chunks, {type: mime}));
+          const a = el('a'); a.href = url; a.download = filename;
+          document.body.append(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+          handedOff++; bar.value = 1;
+          status.textContent = '已交给浏览器保存（源站直连）';
+          handledDirectly = true;
+          for (let w = 0; w < 10; w++) {
+            if (state.stop) break;
+            await sleep(100);
+          }
+        } catch (e) {
+          if (directTimedOut) {
+            errors++; row.classList.add('error'); status.textContent = '下载失败';
+            meta.textContent = '直连下载超时（超过 20 秒），已中止。'; bar.value = 0;
+            break;
+          }
+          if (state.stop || e.message?.includes('安全限制') || e.message?.includes('已停止')) {
+            errors++; row.classList.add('error'); status.textContent = state.stop ? '已停止' : '下载失败';
+            meta.textContent = state.stop ? '本文件已取消，后续文件未开始。' : e.message; bar.value = 0;
+            break;
+          }
+          // 仅在 CORS 限制或网络直连受阻时，平滑降级（fallback）为兼容流式中继保存
+          handledDirectly = false;
+        } finally {
+          clearTimeout(directTimer);
+          try { fileController.abort(); } catch (_) {}
+          if (state.controller === fileController) state.controller = null;
+        }
+      }
+      if (handledDirectly) continue;
+      if (state.stop) break;
+
       let jobId=null;
       try{
         let task = null;
@@ -144,12 +238,29 @@ async function download(posts,assets,metadataIds=[]){
   }finally{state.downloadBusy=false;state.controller=null;$('#stopDownload').hidden=true;updateButtons();}
 }
 
+let currentParseToken = 0;
 async function parse(){
-  state.busy=true;state.parseId=null;updateButtons();message('');$('#parseErrors').replaceChildren();state.posts=[];state.cards.clear();$('#results').replaceChildren();$('#resultCount').textContent='0';$('#emptyState').hidden=true;$('#parseStatus').hidden=false;$('#cancelParse').disabled=false;
+  state.busy=true;state.parseId=null;state.cancelRequested=false;
+  const parseToken = ++currentParseToken;
+  updateButtons();message('');$('#parseErrors').replaceChildren();state.posts=[];state.cards.clear();$('#results').replaceChildren();$('#resultCount').textContent='0';$('#emptyState').hidden=true;$('#parseStatus').hidden=false;$('#cancelParse').disabled=false;
+  $('#parseState').textContent='正在提交解析…';
   try{
-    const task=await api('/api/parse',{method:'POST',body:JSON.stringify({text:$('#shareInput').value})});state.parseId=task.id;
+    const task=await api('/api/parse',{method:'POST',body:JSON.stringify({text:$('#shareInput').value})});
+    if(parseToken!==currentParseToken) return;
+    state.parseId=task.id;
+    if(state.cancelRequested){
+      try{
+        await api(`/api/jobs/${encodeURIComponent(task.id)}`,{method:'DELETE'});
+        $('#parseState').textContent='解析已取消';message('解析已取消。');
+      }catch(err){
+        $('#parseState').textContent='已停止等待';message('已停止等待解析，但后端任务取消未能确认，请稍后检查。',true);
+      }
+      return;
+    }
     for(let i=0;i<1800;i++){
+      if(parseToken!==currentParseToken || state.cancelRequested) return;
       const job=await api(`/api/jobs/${encodeURIComponent(task.id)}`);
+      if(parseToken!==currentParseToken || state.cancelRequested) return;
       $('#parseState').textContent={queued:'等待解析',running:'正在解析',completed:'解析完成',partial:'部分解析成功',failed:'解析失败',cancelled:'解析已取消'}[job.status]||job.status;
       $('#parseCount').textContent=`${job.completed} / ${job.total}`;$('#parseProgress').max=job.total;$('#parseProgress').value=job.completed;
       for(const post of job.items||[])addPost(post);
@@ -158,24 +269,111 @@ async function parse(){
         $('#resultsSubtitle').textContent=`已取得 ${state.posts.length} 个作品。直链可能过期；预览失败时可尝试流式保存。`;
         if(job.status==='failed')message('没有作品解析成功，请查看下方错误原因。',true);
         if(job.status==='partial')message('部分作品未能解析，已保留成功结果。',true);
+        if(job.status==='cancelled')message('解析已取消。');
         return;
       }
       await sleep(1000);
     }
     throw Error('任务监测超时，无法确认解析结果。请稍后重试。');
-  }catch(error){message(error.message,true);$('#parseState').textContent='无法完成解析';}
-  finally{state.busy=false;$('#cancelParse').disabled=true;$('#emptyState').hidden=!!state.posts.length;updateButtons();}
+  }catch(error){if(!state.cancelRequested && parseToken===currentParseToken){message(error.message,true);$('#parseState').textContent='无法完成解析';}}
+  finally{if(parseToken===currentParseToken){state.busy=false;$('#cancelParse').disabled=true;$('#emptyState').hidden=!!state.posts.length;updateButtons();}}
 }
 $('#shareInput').addEventListener('input',()=>{$('#charCount').textContent=`${$('#shareInput').value.length} / 20000`;updateButtons();});
 $('#parseButton').addEventListener('click',parse);
 $('#pasteButton').addEventListener('click',async()=>{try{$('#shareInput').value=(await navigator.clipboard.readText()).slice(0,20000);$('#shareInput').dispatchEvent(new Event('input'));}catch{message('未获得剪贴板权限，请直接粘贴分享内容到输入框。',true);}});
-$('#cancelParse').addEventListener('click',async()=>{if(state.parseId)try{await api(`/api/jobs/${encodeURIComponent(state.parseId)}`,{method:'DELETE'});}catch(error){message(error.message,true);}});
+$('#cancelParse').addEventListener('click',async()=>{
+  state.cancelRequested=true;
+  $('#cancelParse').disabled=true;
+  $('#parseState').textContent='正在取消解析…';
+  const targetId=state.parseId;
+  if(targetId){
+    try{
+      await api(`/api/jobs/${encodeURIComponent(targetId)}`,{method:'DELETE'});
+      $('#parseState').textContent='解析已取消';
+      message('解析已取消。');
+    }catch(error){
+      $('#parseState').textContent='已停止等待';
+      message('已停止等待解析，但后端任务取消未能确认，请稍后检查。',true);
+    }
+  }
+});
 $('#clearButton').addEventListener('click',()=>{state.posts=[];state.cards.clear();$('#results').replaceChildren();$('#parseErrors').replaceChildren();$('#emptyState').hidden=false;$('#resultCount').textContent='0';$('#parseStatus').hidden=true;message('');updateButtons();});
 $('#batchDownload').addEventListener('click',async()=>{try{await download(state.posts,state.posts.flatMap(selected),$('#metadataOption').checked?state.posts.map(p=>p.id):[]);}catch(error){message(error.message,true);}});
 for(const input of document.querySelectorAll('.global-options input[data-kind]'))input.addEventListener('change',()=>{for(const card of state.cards.values()){for(const asset of card.querySelectorAll(`input[data-kind="${input.dataset.kind}"]`))asset.checked=input.checked;const group=$(`input[data-group="${input.dataset.kind}"]`,card);if(group)group.checked=input.checked;}});
+let backendInitToken = 0;
 $('#settingsButton').addEventListener('click',()=>{$('#apiUrl').value=state.base;$('#apiKey').value=state.key;$('#settingsDialog').showModal();});$('#closeSettings').addEventListener('click',()=>$('#settingsDialog').close());
-$('#settingsForm').addEventListener('submit',async event=>{event.preventDefault();const button=$('#connectButton');button.disabled=true;button.textContent='正在连接…';$('#connectionError').textContent='';try{state.base=validBase($('#apiUrl').value.trim());state.key=$('#apiKey').value;const result=await api('/api/health',{},65000);if(result.service!=='douyin-media')throw Error('这个地址不是兼容的抖音媒体后端');state.fileLimit=result.limits.file_bytes;state.batchLimit=result.limits.total_bytes;if(result.requires_api_key){await api('/api/jobs/connection-check',{},10000).catch(error=>{if(!error.message.includes('任务不存在'))throw error;});}localStorage.setItem('shiying-api-url',state.base);connection(true);$('#settingsDialog').close();message(`后端已连接。每批最多 ${result.limits.batch} 条；媒体直接保存到本机。`);}catch(error){connection(false);$('#connectionError').textContent=error.message;}finally{button.disabled=false;button.textContent='测试并连接 →';}});
-try{state.base=localStorage.getItem('shiying-api-url')||(['localhost','127.0.0.1'].includes(location.hostname)?'http://127.0.0.1:8000':'');}catch{}
-connection(false);
+$('#settingsForm').addEventListener('submit',async event=>{
+  event.preventDefault();
+  backendInitToken++;
+  const button=$('#connectButton');button.disabled=true;button.textContent='正在连接…';$('#connectionError').textContent='';
+  try{
+    state.base=validBase($('#apiUrl').value.trim());state.key=$('#apiKey').value;
+    const result=await api('/api/health',{},65000);
+    if(result.service!=='douyin-media')throw Error('这个地址不是兼容的抖音媒体后端');
+    state.fileLimit=result.limits.file_bytes;state.batchLimit=result.limits.total_bytes;
+    if(result.requires_api_key){
+      await api('/api/jobs/connection-check',{},10000).catch(error=>{if(!error.message.includes('任务不存在'))throw error;});
+    }
+    localStorage.setItem('shiying-api-url',state.base);
+    connection(true);
+    $('#settingsDialog').close();
+    message(`后端已连接。每批最多 ${result.limits.batch} 条；媒体直接保存到本机。`);
+  }catch(error){
+    connection(false);
+    $('#connectionError').textContent=error.message;
+  }finally{
+    button.disabled=false;button.textContent='测试并连接 →';
+  }
+});
+async function initBackend(){
+  const currentToken = ++backendInitToken;
+  let userSaved='';
+  try{userSaved=localStorage.getItem('shiying-api-url')||'';}catch{}
+
+  let defaultUrl='';
+  try{
+    const configUrl=new URL('./config.json',import.meta.url).href;
+    const resp=await fetch(configUrl,{cache:'no-store'});
+    if(resp.ok){
+      const cfg=await resp.json();
+      if(cfg && typeof cfg.apiBaseUrl==='string' && cfg.apiBaseUrl.trim()){
+        defaultUrl=validBase(cfg.apiBaseUrl.trim());
+      }
+    }
+  }catch{}
+
+  const activeUrl=userSaved||defaultUrl;
+  if(backendInitToken!==currentToken) return;
+  if(activeUrl){
+    state.base=activeUrl;
+    try{
+      const result=await api('/api/health',{},5000);
+      if(backendInitToken!==currentToken || state.base!==activeUrl) return;
+      if(result && result.service==='douyin-media'){
+        state.fileLimit=result.limits?.file_bytes||state.fileLimit;
+        state.batchLimit=result.limits?.total_bytes||state.batchLimit;
+        if(result.requires_api_key && !state.key){
+          connection(false);
+          message('后端已就绪但需要访问密钥，请在设置中输入密钥后连接。');
+          return;
+        }
+        connection(true);
+        message(`后端已连接。每批最多 ${result.limits?.batch||10} 条；媒体直接保存到本机。`);
+        return;
+      }
+    }catch{
+      if(backendInitToken===currentToken && state.base===activeUrl) connection(false);
+      return;
+    }
+    return;
+  }
+
+  // 配置为空时保持原版行为
+  if(backendInitToken!==currentToken) return;
+  try{state.base=(['localhost','127.0.0.1'].includes(location.hostname)?'http://127.0.0.1:8000':'');}catch{}
+  connection(false);
+}
+
+initBackend();
 
 $('#stopDownload').addEventListener('click',()=>{state.stop=true;state.controller?.abort();});

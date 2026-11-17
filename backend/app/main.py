@@ -33,7 +33,7 @@ class JobStore:
                 self.jobs.pop(k, None)
                 if len(self.jobs) < settings.MAX_IN_MEMORY_JOBS:
                     break
-        if len(self.jobs)>=settings.MAX_IN_MEMORY_JOBS:raise HTTPException(429,'当前任务数已达上限，请稍后重试')
+        if len(self.jobs)>=settings.MAX_IN_MEMORY_JOBS:raise HTTPException(429,'当前任务数已达上限，请稍后重试',headers={'Retry-After':'5'})
         key=secrets.token_urlsafe(24);now=time.monotonic()
         job={'id':key,'kind':kind,'status':'queued','created':now,'updated':now,'bytes':0,'source_bytes':0,'expected_bytes':None,'files_done':0,'error':None}
         self.jobs[key]=job;return job
@@ -246,4 +246,4 @@ async def get_file(key: str, request: Request):
     return TransferResponse(job)
 
 # CORS wraps error responses from the body-limit middleware too.
-app.add_middleware(CORSMiddleware,allow_origins=settings.CORS_ORIGINS,allow_credentials=False,allow_methods=['GET','POST','DELETE'],allow_headers=['Authorization','Content-Type'],expose_headers=['Content-Length','Content-Disposition'])
+app.add_middleware(CORSMiddleware,allow_origins=settings.CORS_ORIGINS,allow_credentials=False,allow_methods=['GET','POST','DELETE'],allow_headers=['Authorization','Content-Type'],expose_headers=['Content-Length','Content-Disposition','Retry-After'])
