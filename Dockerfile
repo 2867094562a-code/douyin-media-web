@@ -3,8 +3,12 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libatomic1 \
+        ca-certificates \
+    && pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/* /tmp/* \
     && useradd --create-home --uid 10001 appuser \
     && chmod -R a+rX /ms-playwright
 COPY --chown=appuser:appuser backend/ ./backend/
